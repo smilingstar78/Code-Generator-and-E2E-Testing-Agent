@@ -1,0 +1,11 @@
+langgraph
+langchain-core
+langchain-groq
+langchain-openai
+langchain-community
+pydantic
+pydantic-settings
+docker
+fastapi
+uvicorn
+python-dotenv
