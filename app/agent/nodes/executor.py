@@ -1,17 +1,19 @@
+from app.sandbox.docker_executor import DockerExecutor
 from app.agent.state import AgentState
-from app.sandbox.container_runner import run_code_in_sandbox
+
+executor_instance = DockerExecutor()
 
 def executor_node(state: AgentState) -> AgentState:
-    """
-    LangGraph Node: Mounts generated code files into Docker and runs Pytest.
-    """
     files = state.get("files", {})
+    exit_code, logs = executor_instance.run_tests(files)
     
-    # Run code in hardened Docker sandbox
-    exit_code, logs = run_code_in_sandbox(files)
+    iterations = state.get("iterations", 0) + 1
+    is_complete = (exit_code == 0)
     
-    # Update global state with test outcome
-    state["execution_exit_code"] = exit_code
-    state["test_logs"] = logs
-    
-    return state
+    return {
+        **state,
+        "execution_exit_code": exit_code,
+        "test_logs": logs,
+        "iterations": iterations,
+        "is_complete": is_complete
+    }

@@ -1,47 +1,55 @@
+from langchain_groq import ChatGroq
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.output_parsers import JsonOutputParser
 from pydantic import BaseModel, Field
 from typing import Dict
-from langchain_core.prompts import ChatPromptTemplate
 from app.agent.state import AgentState
-from app.core.llm import get_llm
 
-class FixedCodeOutput(BaseModel):
+class FixedCodebase(BaseModel):
     files: Dict[str, str] = Field(
-        description="Repaired dictionary mapping filenames to updated, fixed Python code strings."
+        description="Updated dictionary mapping file names to complete corrected source code strings."
     )
-    explanation: str = Field(description="Short summary of what was fixed.")
+
+llm = ChatGroq(
+    model_name="openai/gpt-oss-120b", 
+    temperature=0.1,
+    max_tokens=4096
+)
+parser = JsonOutputParser(pydantic_object=FixedCodebase)
+
+prompt = ChatPromptTemplate.from_messages([
+    ("system", 
+     "You are an expert debugging engineer. Analyze test failure logs and fix code/test files.\n\n"
+     "CONSTRAINTS:\n"
+     "1. Keep code and tests concise without large docstrings or comments.\n"
+     "2. Ensure all test files start with 'test_' and test functions start with 'test_'.\n"
+     "3. Output strictly valid JSON.\n\n"
+     "{format_instructions}"),
+    ("user", 
+     "Original Specification: {specification}\n"
+     "Current Files: {files}\n"
+     "Execution Test Failure Logs:\n{test_logs}")
+])
 
 def fixer_node(state: AgentState) -> AgentState:
-    """
-    LangGraph Node: Analyzes test logs/errors and patches broken files.
-    """
-    llm = get_llm()
-    structured_llm = llm.with_structured_output(FixedCodeOutput)
+    specification = state["specification"]
+    files = state.get("files", {})
+    test_logs = state.get("test_logs", "")
 
-    prompt_template = ChatPromptTemplate.from_messages([
-        ("system", (
-            "You are a Senior Software Maintenance & Debugging Engineer.\n"
-            "Your code failed syntax validation or unit tests. Analyze the error logs and repair the code.\n\n"
-            "CRITICAL INSTRUCTIONS:\n"
-            "1. Fix the root cause identified in the test logs.\n"
-            "2. Do not remove test cases unless they contradict the specification.\n"
-            "3. Return the entire updated file set with all bugs resolved."
-        )),
-        ("user", (
-            "Original Specification: {specification}\n\n"
-            "Current Code Files:\n{files}\n\n"
-            "Failure Logs / Traceback:\n{test_logs}\n\n"
-            "Please fix the code and return the repaired files."
-        ))
-    ])
+    chain = prompt | llm | parser
 
-    chain = prompt_template | structured_llm
-    result: FixedCodeOutput = chain.invoke({
-        "specification": state["specification"],
-        "files": str(state["files"]),
-        "test_logs": state.get("test_logs", "Unknown error")
-    })
+    try:
+        result = chain.invoke({
+            "specification": specification,
+            "files": files,
+            "test_logs": test_logs,
+            "format_instructions": parser.get_format_instructions()
+        })
 
-    # Update state with repaired code and increment iteration count
-    state["files"] = result.files
-    state["iterations"] = state.get("iterations", 0) + 1
-    return state
+        return {
+            **state,
+            "files": result.get("files", files)
+        }
+    except Exception as e:
+        print(f"Fixer Node Error: {e}")
+        return state

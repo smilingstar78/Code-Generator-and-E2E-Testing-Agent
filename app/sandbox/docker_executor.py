@@ -1,93 +1,78 @@
 import docker
-import os
-import tempfile
-from typing import Dict, Tuple
+import base64
 
 class DockerExecutor:
-    def __init__(self, image_name: str = "agent-sandbox:latest"):
-        self.image_name = image_name
-        self.client = docker.from_env()
-        self._warm_container = None
-        self._ensure_warm_container()
+    def __init__(self, container_name: str = "agent-sandbox-warm"):
+        self.container_name = container_name
+        self.client = None
 
-    def _ensure_warm_container(self):
-        """Ensures a persistent warm sandbox container is active for ultra-fast execution."""
+    def _get_client(self):
+        """Lazily connects to Docker daemon so FastAPI never crashes on startup."""
+        if self.client is None:
+            self.client = docker.from_env()
+        return self.client
+
+    def run_tests(self, files: dict) -> tuple[int, str]:
         try:
-            if self._warm_container:
-                self._warm_container.reload()
-                if self._warm_container.status == "running":
-                    return
-
-            # Clean up any leftover warm containers
-            containers = self.client.containers.list(all=True, filters={"name": "agent-sandbox-warm"})
-            for c in containers:
-                c.remove(force=True)
-
-            # Start background container
-            self._warm_container = self.client.containers.run(
-                image=self.image_name,
-                command="tail -f /dev/null",
-                name="agent-sandbox-warm",
-                detach=True,
-                network_disabled=True,
-                mem_limit="256m"
-            )
-        except Exception as e:
-            print(f"Warning: Failed to initialize warm container pool: {e}")
-
-    def run_pytest(self, files: Dict[str, str], timeout: int = 15) -> Tuple[int, str]:
-        """
-        Executes pytest inside the warm container using docker exec for sub-second execution times.
-        """
-        self._ensure_warm_container()
-
-        try:
-            # Clean container workdir
-            self._warm_container.exec_run("rm -rf /app/*")
+            client = self._get_client()
             
-            # Write files into container
-            for filename, content in files.items():
-                self._warm_container.exec_run(
-                    f'sh -c "cat << \'EOF\' > /app/{filename}\n{content}\nEOF"'
+            # 1. Auto-start or create the warm container if stopped/missing
+            try:
+                container = client.containers.get(self.container_name)
+                if container.status != "running":
+                    container.start()
+            except docker.errors.NotFound:
+                container = client.containers.run(
+                    "python:3.11-slim",
+                    command="tail -f /dev/null",
+                    name=self.container_name,
+                    working_dir="/app",
+                    detach=True
                 )
 
-            # Fast Pytest execution
-            exec_result = self._warm_container.exec_run(
-                cmd="pytest --tb=short",
-                workdir="/app"
-            )
+            # 2. Guarantee pytest is installed even in pre-existing containers
+            check_pytest = container.exec_run("python -m pytest --version", user="root")
+            if check_pytest.exit_code != 0:
+                container.exec_run("pip install --no-cache-dir pytest", user="root")
 
-            exit_code = exec_result.exit_code
-            logs = exec_result.output.decode("utf-8")
-            return exit_code, logs
+            # 3. Wipe old workspace files cleanly using sh -c so wildcards expand
+            container.exec_run("sh -c 'rm -rf /app/* /app/.[!.]*'", workdir="/app", user="root")
+            
+            # 4. Inject generated files via Base64 (supports nested directories)
+            for filename, content in files.items():
+                clean_name = filename.strip().lstrip("/")
+                if "/" in clean_name:
+                    folder = "/".join(clean_name.split("/")[:-1])
+                    container.exec_run(f"mkdir -p /app/{folder}", workdir="/app", user="root")
+                b64_content = base64.b64encode(content.encode("utf-8")).decode("utf-8")
+                write_cmd = f"sh -c 'echo {b64_content} | base64 -d > /app/{clean_name}'"
+                container.exec_run(write_cmd, workdir="/app", user="root")
+
+            # 5. Install dependencies if requirements.txt exists
+            install_logs = ""
+            if "requirements.txt" in files and files["requirements.txt"].strip():
+                pip_res = container.exec_run(
+                    "pip install --no-cache-dir -r requirements.txt",
+                    workdir="/app",
+                    user="root"
+                )
+                install_logs = f"--- PIP INSTALL LOGS ---\n{pip_res.output.decode('utf-8', errors='ignore')}\n\n"
+
+            # 6. Run Pytest with explicit PYTHONPATH=/app so local imports always resolve
+            exec_res = container.exec_run(
+                "sh -c 'PYTHONPATH=/app python -m pytest -v'",
+                workdir="/app",
+                user="root"
+            )
+            
+            exit_code = exec_res.exit_code
+            test_logs = exec_res.output.decode("utf-8", errors="ignore")
+            
+            return exit_code, f"{install_logs}--- PYTEST EXECUTION LOGS ---\n{test_logs}"
 
         except Exception as e:
-            print(f"Exec execution failed, reverting to fallback spin-up: {e}")
-            return self._run_pytest_fallback(files, timeout)
-
-    def _run_pytest_fallback(self, files: Dict[str, str], timeout: int = 30) -> Tuple[int, str]:
-        """Fallback ephemeral container runner."""
-        with tempfile.TemporaryDirectory() as temp_dir:
-            for filename, content in files.items():
-                file_path = os.path.join(temp_dir, filename)
-                os.makedirs(os.path.dirname(file_path), exist_ok=True)
-                with open(file_path, "w", encoding="utf-8") as f:
-                    f.write(content)
-
-            try:
-                container = self.client.containers.run(
-                    image=self.image_name,
-                    command="pytest --tb=short",
-                    volumes={temp_dir: {"bind": "/app", "mode": "rw"}},
-                    working_dir="/app",
-                    detach=True,
-                    network_disabled=True,
-                    mem_limit="256m"
-                )
-                result = container.wait(timeout=timeout)
-                exit_code = result.get("StatusCode", 1)
-                logs = container.logs(stdout=True, stderr=True).decode("utf-8")
-                container.remove(force=True)
-                return exit_code, logs
-            except Exception as e:
-                return 1, f"Docker Execution Error: {str(e)}"
+            self.client = None
+            return -1, (
+                f"Docker Execution Exception: {str(e)}\n\n"
+                "👉 Make sure Docker Desktop is open and the Engine is running!"
+            )
